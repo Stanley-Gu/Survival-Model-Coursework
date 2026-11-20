@@ -200,7 +200,7 @@ def main():
     scale = float(np.exp(aft.params_.loc[("lambda_", "Intercept")]))
     beta_aft = -aft.params_.loc["lambda_", PREDICTORS].to_numpy()
     beta_cox = cox.params_.loc[PREDICTORS].to_numpy()
-    # Compute proportional hazards coefficients and their covariance for inference.
+    # Compute proportional hazards and their covariance for inference.
     theta, covariance_ph, _ = weibull_ph_inference(
         analysis, scale, shape, beta_aft)
     pd.DataFrame(covariance_ph, index=PREDICTORS, columns=PREDICTORS).to_csv(
@@ -237,7 +237,7 @@ def main():
                   "Estimate": [scale, shape]}).to_csv(
                       output / "task2b_weibull_parameters.csv", index=False)
 
-    # Save formatted LaTeX rows for the two hazard-ratio tables.
+    # Save formatted LaTeX rows for the two proportional hazards tables.
     for name, table in [("cox", cox_table), ("weibull", weibull_table)]:
         lines = []
         for row in table.itertuples(index=False):
