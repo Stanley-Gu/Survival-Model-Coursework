@@ -1,6 +1,6 @@
 """
 Survival Models coursework: Question 2
-Data source: UCI Heart Failure Clinical Records, DOI 10.24432/C5Z89R.
+Data source: UCI Heart Failure Clinical Records, DOI 10.24432/C5Z89R
 """
 
 from pathlib import Path
@@ -21,6 +21,7 @@ REFERENCE_CR = 1.1
 FORMULA = "age_c + ef_c + ln_cr_c"
 GROUPS = ["EF <= 30%", "30% < EF <= 40%", "EF > 40%"]
 COLOURS = ["tab:orange", "tab:green", "tab:blue"]
+# EF values for the three fitted profiles.
 PROFILE_EF = [25.0, 38.0, 50.0]
 
 
@@ -71,10 +72,10 @@ def breslow_baseline(analysis, beta):
 
 
 def weibull_ph_inference(analysis, scale, shape, beta_aft):
-    """Estimate Weibull PH coefficients and their covariance.
+    """Estimate Weibull proportional hazards and their covariance.
 
     Use BFGS with the AFT estimates as starting values. Invert the full
-    observed information, then extract the PH coefficient block so
+    observed information, then extract the proportional hazards block so
     the standard errors include uncertainty in the shape parameter.
     """
     X = np.column_stack([np.ones(len(analysis)), analysis[PREDICTORS]])
@@ -160,7 +161,7 @@ def main():
         "serum_creatinine": "Serum creatinine (mg/dL)",
         "time": "Observed follow-up (days)",
     }
-    # Compute descriptive statistics for each selected variable.
+    # Compute general statistics for each selected variable.
     rows = []
     for variable, label in labels.items():
         x = data[variable]
@@ -168,22 +169,22 @@ def main():
                      "Mean": x.mean(), "SD": x.std(), "Median": x.median(),
                      "Q1": x.quantile(0.25), "Q3": x.quantile(0.75),
                      "Minimum": x.min(), "Maximum": x.max()})
-    descriptive = pd.DataFrame(rows)
-    descriptive.to_csv(output / "task2a_descriptive.csv", index=False)
+    general = pd.DataFrame(rows)
+    general.to_csv(output / "task2a_general.csv", index=False)
 
     print("\nQUESTION 2(a): SAMPLE")
     print(f"Missing values in selected columns: {data.isna().sum().sum()}")
     print(counts.to_string(index=False))
-    print(descriptive.round(3).to_string(index=False))
+    print(general.round(3).to_string(index=False))
 
     # ========================================================
-    # Part (b): Fit the Cox and AFT models
+    # Part (b): Fit the Cox and Weibull models
     # ========================================================
     # Store the transformed covariates with follow-up time and event status.
     analysis = data[["time", "DEATH_EVENT"]].join(transform_covariates(data))
     analysis.to_csv(output / "task2_analysis_data.csv", index=False)
 
-    # Fit the Cox model; lifelines uses Efron's method for tied deaths.
+    # Fit the Cox model; python package lifelines uses Efron's method for tied deaths.
     cox = CoxPHFitter(alpha=0.05)
     cox.fit(analysis, duration_col="time", event_col="DEATH_EVENT",
             formula=FORMULA)
@@ -200,17 +201,17 @@ def main():
     scale = float(np.exp(aft.params_.loc[("lambda_", "Intercept")]))
     beta_aft = -aft.params_.loc["lambda_", PREDICTORS].to_numpy()
     beta_cox = cox.params_.loc[PREDICTORS].to_numpy()
-    # Compute proportional hazards and their covariance for inference.
+    # Compute Weibull proportional hazards and their covariance for inference.
     theta, covariance_ph, _ = weibull_ph_inference(
         analysis, scale, shape, beta_aft)
     pd.DataFrame(covariance_ph, index=PREDICTORS, columns=PREDICTORS).to_csv(
         output / "task2b_weibull_PH_covariance.csv")
-    aft.variance_matrix_.to_csv(output / "task2b_weibull_software_covariance.csv")
+    aft.variance_matrix_.to_csv(output / "task2b_weibull_covariance.csv")
 
     contrasts = ["Age: +1 year", "Ejection fraction: +1 percentage point",
                  "Serum creatinine: +10%"]
     # Use changes of one year, one EF percentage point and 10% creatinine.
-    # The last change is ln(1.1) on the log-creatinine scale.
+    # The last term is ln(1.1) on the log-creatinine scale.
     changes = np.array([1.0, 1.0, np.log(1.1)])
     effects, cox_rows, weibull_rows = [], [], []
     for j, (variable, contrast, change) in enumerate(zip(PREDICTORS, contrasts, changes)):
@@ -237,7 +238,7 @@ def main():
                   "Estimate": [scale, shape]}).to_csv(
                       output / "task2b_weibull_parameters.csv", index=False)
 
-    # Save formatted LaTeX rows for the two proportional hazards tables.
+    # Save formatted LaTeX rows for the two proportional hazard tables.
     for name, table in [("cox", cox_table), ("weibull", weibull_table)]:
         lines = []
         for row in table.itertuples(index=False):
@@ -261,7 +262,7 @@ def main():
     # ========================================================
     # Part (c): Compute and plot the survival curves
     # ========================================================
-    # Divide patients into three EF groups and count their event outcomes.
+    # Divide patients into three EF groups and count their event status.
     data["EF_group"] = pd.cut(data["ejection_fraction"],
                               bins=[-np.inf, 30, 40, np.inf], labels=GROUPS)
     group_summary = data.groupby("EF_group", observed=True).agg(
@@ -299,7 +300,7 @@ def main():
         "Weibull_shape": [np.nan, shape],
     }).to_csv(output / "task2b_fit_details.csv", index=False)
 
-    # Compute the baseline at z=0 and obtain survival for each model.
+    # Compute the baseline at z=0 and obtain survival for each profile.
     baseline = breslow_baseline(analysis, beta_cox)
     baseline.to_csv(output / "task2c_breslow_baseline.csv", index_label="Time")
     relative_hazard = np.exp(encoded_profiles[PREDICTORS].to_numpy() @ beta_cox)
