@@ -1,0 +1,419 @@
+"""Survival Models coursework, Question 2: UCI heart failure records.
+
+Put the UCI CSV beside this script, then run: python task2.py
+Or specify its location: python task2.py --data "path/to/data.csv"
+Dependencies: numpy pandas scipy matplotlib lifelines
+Install with: python -m pip install numpy pandas scipy matplotlib lifelines
+Verified with Python 3.12 and lifelines 0.30.3.
+
+Source: https://archive.ics.uci.edu/dataset/519/heart+failure+clinical+records
+Dataset DOI: 10.24432/C5Z89R (CC BY 4.0).
+All outputs are saved in task2_output next to this script.
+The comments explain each calculation for parts (a)-(c). The CSV tables
+contain the unrounded results underlying Tables 1-4; the three-panel
+survival plot reproduces Figure 3. Rounding is only for presentation.
+"""
+
+from pathlib import Path
+import argparse
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from lifelines import CoxPHFitter, KaplanMeierFitter, WeibullAFTFitter
+from scipy.stats import norm, chi2
+from scipy.optimize import minimize
+
+
+PREDICTORS = ["age_c", "ef_c", "ln_cr_c"]
+REFERENCE_AGE = 60.0
+REFERENCE_EF = 38.0
+REFERENCE_CR = 1.1
+FORMULA = "age_c + ef_c + ln_cr_c"
+GROUPS = ["EF <= 30%", "30% < EF <= 40%", "EF > 40%"]
+COLOURS = ["tab:orange", "tab:green", "tab:blue"]
+# The three representative EF values used in the report (also the medians
+# within the three EF groups in this dataset). Age and creatinine stay fixed.
+PROFILE_EF = [25.0, 38.0, 50.0]
+
+
+def transform_covariates(data):
+    """z = (age-60, EF-38, ln(creatinine/1.1)); np.log is natural log.
+
+    These fixed reference values equal the sample medians.
+    Apply the same transformation for fitting and prediction.
+    """
+    return pd.DataFrame({
+        "age_c": data["age"] - REFERENCE_AGE,
+        "ef_c": data["ejection_fraction"] - REFERENCE_EF,
+        "ln_cr_c": np.log(data["serum_creatinine"] / REFERENCE_CR),
+    }, index=data.index)
+
+
+def save_figure(fig, output, name):
+    fig.tight_layout()
+    fig.savefig(output / f"{name}.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output / f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def wald_effect(log_ph, standard_error):
+    """Return a hazard ratio (called PH in the report), its CI and p-value.
+
+    For a covariate change c, log_ph=c*coefficient and SE=|c|*SE(coefficient).
+    The 95% interval is exp(log_ph +/- 1.96*SE). Under H0: log_ph=0,
+    (log_ph/SE)**2 is approximately chi-squared with one degree of freedom;
+    its upper-tail probability is the two-sided Wald p-value.
+    """
+    z = log_ph / standard_error
+    margin = norm.ppf(0.975) * standard_error
+    return {"log_PH": log_ph, "SE_log_PH": standard_error,
+            "PH": np.exp(log_ph), "lower95": np.exp(log_ph - margin),
+            "upper95": np.exp(log_ph + margin), "Wald_chi2": z * z,
+            "p": chi2.sf(z * z, df=1)}
+
+
+def breslow_baseline(analysis, beta):
+    """H0(t)=sum d_j / sum_{i at risk} exp(beta dot z_i), at reference z=0.
+
+    Include patients censored at the event time in the risk set. Use all
+    distinct observation times (zero increments at censor-only times).
+    """
+    scores = np.exp(analysis[PREDICTORS].to_numpy() @ beta)
+    times = analysis["time"].to_numpy()
+    events = analysis["DEATH_EVENT"].to_numpy()
+    rows = []
+    for t in np.sort(np.unique(times)):
+        deaths = int(events[times == t].sum())
+        denominator = scores[times >= t].sum()
+        rows.append((t, deaths, denominator, deaths / denominator))
+    result = pd.DataFrame(rows, columns=["Time", "Deaths", "Risk_score_sum", "dH0"])
+    result = result.set_index("Time")
+    result["H0"] = result["dH0"].cumsum()
+    result["S0"] = np.exp(-result["H0"])
+    return result
+
+
+def weibull_ph_inference(analysis, scale, shape, beta_aft):
+    """Same Weibull model in PH coordinates; full-likelihood Wald inference.
+
+    H(t;z) = exp(a + theta dot z + eta*log(t)),
+    a=-eta*log(alpha), theta=eta*beta_AFT, r=log(eta).
+    The model has h(t;z)=eta*H(t;z)/t, so the censored log-likelihood is
+    sum[event_i*log(h_i) - H_i]. Both deaths and censored patients
+    contribute -H_i; only deaths contribute log(h_i).
+
+    Optimise this same likelihood in PH coordinates using BFGS, a
+    quasi-Newton method, starting from the AFT estimates. Calculate the
+    observed information (the Hessian of the negative log-likelihood)
+    analytically, then invert the full matrix, including intercept and
+    shape. Its theta block supplies the variances for the report's PH
+    confidence intervals and Wald tests. This accounts for uncertainty
+    in eta as well as beta; eta must not be treated as known.
+    """
+    X = np.column_stack([np.ones(len(analysis)), analysis[PREDICTORS]])
+    log_t = np.log(analysis["time"].to_numpy())
+    event = analysis["DEATH_EVENT"].to_numpy()
+    start = np.r_[-shape * np.log(scale), shape * beta_aft, np.log(shape)]
+
+    def objective(p):
+        eta = np.exp(p[-1])
+        log_H = X @ p[:-1] + eta * log_t
+        H = np.exp(log_H)
+        residual = event - H
+        # log f = log h - H; censored observations contribute -H.
+        nll = np.sum(H - event * (p[-1] + log_H - log_t))
+        gradient = -np.r_[X.T @ residual,
+                          np.sum(event + eta * log_t * residual)]
+        return nll, gradient
+
+    fit = minimize(objective, start, jac=True, method="BFGS",
+                   options={"gtol": 1e-8, "maxiter": 2000})
+    if np.max(np.abs(objective(fit.x)[1])) > 1e-5:
+        raise RuntimeError(f"Weibull PH optimisation did not converge: {fit.message}")
+    p = fit.x
+    eta = np.exp(p[-1])
+    H = np.exp(X @ p[:-1] + eta * log_t)
+    u = eta * log_t
+    information = np.zeros((len(p), len(p)))
+    information[:-1, :-1] = X.T @ (H[:, None] * X)
+    information[:-1, -1] = X.T @ (H * u)
+    information[-1, :-1] = information[:-1, -1]
+    information[-1, -1] = np.sum(H * u**2 - (event - H) * u)
+    covariance = np.linalg.inv(information)
+    return p[1:-1], covariance[1:-1, 1:-1], -fit.fun
+
+
+def main():
+    folder = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, help="Path to the UCI CSV")
+    args = parser.parse_args()
+
+    if args.data is not None:
+        data_path = args.data.expanduser().resolve()
+    else:
+        data_path = folder / "heart_failure_clinical_records_dataset.csv"
+        if not data_path.is_file():
+            raise FileNotFoundError(
+                "Put the heart failure CSV beside task2.py, or use --data PATH."
+            )
+
+    # ========================================================
+    # 2(a): Import data and describe the analysis sample (Table 1)
+    # ========================================================
+    raw = pd.read_csv(data_path)
+    required = ["time", "DEATH_EVENT", "age", "ejection_fraction",
+                "serum_creatinine"]
+    # Keep observed follow-up, death indicator and the three covariates.
+    # DEATH_EVENT=1 denotes a death; 0 denotes right-censoring. Keep all
+    # patients. One finite-value check detects missing values too.
+    data = raw[required].copy()
+    if not np.isfinite(data.to_numpy()).all():
+        raise ValueError("Selected columns contain missing or non-finite values.")
+    if not data["DEATH_EVENT"].isin([0, 1]).all():
+        raise ValueError("DEATH_EVENT must be 1 (death) or 0 (censored).")
+    if not (data[["time", "serum_creatinine"]] > 0).all().all():
+        raise ValueError("Time and serum creatinine must be positive for logarithms.")
+    data["DEATH_EVENT"] = data["DEATH_EVENT"].astype(int)
+
+    output = folder / "task2_output"
+    output.mkdir(exist_ok=True)
+    plt.rcParams.update({"font.size": 11, "axes.labelsize": 12})
+
+    # Store sample size, deaths, censored count and death proportion.
+    # Summarise each continuous variable by median, quartiles and range
+    # for Table 1; mean and standard deviation are saved as extra summaries.
+    counts = pd.DataFrame({
+        "Quantity": ["Patients", "Observed deaths", "Right-censored", "Death proportion"],
+        "Value": [len(data), data.DEATH_EVENT.sum(),
+                  (data.DEATH_EVENT == 0).sum(), data.DEATH_EVENT.mean()],
+    })
+    counts.to_csv(output / "task2a_sample_counts.csv", index=False)
+
+    labels = {
+        "age": "Age (years)",
+        "ejection_fraction": "Ejection fraction (%)",
+        "serum_creatinine": "Serum creatinine (mg/dL)",
+        "time": "Observed follow-up (days)",
+    }
+    rows = []
+    for variable, label in labels.items():
+        x = data[variable]
+        rows.append({"Variable": label, "N": x.size,
+                     "Mean": x.mean(), "SD": x.std(), "Median": x.median(),
+                     "Q1": x.quantile(0.25), "Q3": x.quantile(0.75),
+                     "Minimum": x.min(), "Maximum": x.max()})
+    descriptive = pd.DataFrame(rows)
+    descriptive.to_csv(output / "task2a_descriptive.csv", index=False)
+    # The follow-up median above is not an estimate of median survival.
+
+    print("\nQUESTION 2(a): SAMPLE")
+    print(f"Missing values in selected columns: {data.isna().sum().sum()}")
+    print(counts.to_string(index=False))
+    print(descriptive.round(3).to_string(index=False))
+
+    # ========================================================
+    # 2(b): Fit both models to the same patients and predictors
+    # ========================================================
+    # Store z=(age-60, EF-38, ln(creatinine/1.1)). Centring changes the
+    # reference patient, not the covariate effects. z=0 is age 60, EF 38%,
+    # creatinine 1.1 mg/dL. Both models use the same observations and z.
+    analysis = data[["time", "DEATH_EVENT"]].join(transform_covariates(data))
+    analysis.to_csv(output / "task2_analysis_data.csv", index=False)
+
+    # Cox: h(t;z)=h0(t)*exp(beta dot z). lifelines estimates beta by
+    # Newton-Raphson maximisation of the partial log-likelihood, using
+    # Efron's method for tied death times. The inverse observed information
+    # provides the coefficient covariance matrix for Table 2.
+    cox = CoxPHFitter(alpha=0.05)
+    cox.fit(analysis, duration_col="time", event_col="DEATH_EVENT",
+            formula=FORMULA)
+
+    # Weibull AFT software convention: log(scale(z)) = intercept + gamma dot z.
+    # The shape k is constant across patients. The package calls a(x)
+    # "lambda_"; this is a scale, unlike the coefficient lambda in Task 1.
+    aft = WeibullAFTFitter(alpha=0.05, model_ancillary=False)
+    aft.fit(analysis, duration_col="time", event_col="DEATH_EVENT",
+            formula=FORMULA)
+
+    cox.summary.to_csv(output / "task2b_cox_full_summary.csv")
+    aft.summary.to_csv(output / "task2b_weibull_full_summary.csv")
+
+    # lifelines uses log(scale(z)) = intercept + gamma dot z.
+    # Notes: S(t;z) = exp[-(t*exp(beta dot z)/alpha)**eta].
+    # Therefore alpha=exp(intercept), beta=-gamma, eta=exp(log_shape).
+    # Store these as scale, beta_aft and shape. A positive beta in the
+    # notes' convention shortens survival times; its time ratio is
+    # exp(-beta*change). Its hazard ratio is exp(eta*beta*change).
+    shape = float(np.exp(aft.params_.loc[("rho_", "Intercept")]))
+    scale = float(np.exp(aft.params_.loc[("lambda_", "Intercept")]))
+    beta_aft = -aft.params_.loc["lambda_", PREDICTORS].to_numpy()
+    beta_cox = cox.params_.loc[PREDICTORS].to_numpy()
+    # Inference in PH coordinates reproduces the report's Weibull table.
+    # The PH fit is a numerical reparameterisation of the same AFT likelihood.
+    theta, covariance_ph, _ = weibull_ph_inference(
+        analysis, scale, shape, beta_aft)
+    pd.DataFrame(covariance_ph, index=PREDICTORS, columns=PREDICTORS).to_csv(
+        output / "task2b_weibull_PH_covariance.csv")
+    aft.variance_matrix_.to_csv(output / "task2b_weibull_software_covariance.csv")
+
+    contrasts = ["Age: +1 year", "Ejection fraction: +1 percentage point",
+                 "Serum creatinine: +10%"]
+    # Tables 2 and 3 use changes of one year, one EF percentage point and
+    # a relative 10% creatinine increase. The last changes ln(creatinine/1.1)
+    # by ln(1.1), not 0.1. Apply each change to both coefficient and SE.
+    changes = np.array([1.0, 1.0, np.log(1.1)])
+    effects, cox_rows, weibull_rows = [], [], []
+    for j, (variable, contrast, change) in enumerate(zip(PREDICTORS, contrasts, changes)):
+        c = wald_effect(change * beta_cox[j],
+                        change * np.sqrt(cox.variance_matrix_.loc[variable, variable]))
+        w = wald_effect(change * theta[j], change * np.sqrt(covariance_ph[j, j]))
+        cox_rows.append({"Contrast": contrast, **c})
+        weibull_rows.append({"Contrast": contrast, **w})
+        effects.append({"Covariate": variable, "Contrast": contrast,
+                        **{"Cox_" + key: value for key, value in c.items()},
+                        **{"Weibull_" + key: value for key, value in w.items()},
+                        "Weibull_TR": np.exp(-change * beta_aft[j])})
+    effects = pd.DataFrame(effects)
+    effects.to_csv(output / "task2b_model_comparison.csv", index=False)
+    cox_table = pd.DataFrame(cox_rows)
+    weibull_table = pd.DataFrame(weibull_rows)
+    cox_table.to_csv(output / "task2b_cox_PH.csv", index=False)
+    weibull_table.to_csv(output / "task2b_weibull_PH.csv", index=False)
+    coefficients = pd.DataFrame({"Covariate": PREDICTORS, "Cox_beta": beta_cox,
+                                 "Weibull_AFT_beta_notes": beta_aft,
+                                 "Weibull_PH_eta_beta": theta})
+    coefficients.to_csv(output / "task2b_coefficients.csv", index=False)
+    pd.DataFrame({"Parameter": ["alpha (baseline scale, days)", "eta (shape)"],
+                  "Estimate": [scale, shape]}).to_csv(
+                      output / "task2b_weibull_parameters.csv", index=False)
+
+    # Export LaTeX rows for Tables 2 and 3.
+    for name, table in [("cox", cox_table), ("weibull", weibull_table)]:
+        lines = []
+        for row in table.itertuples(index=False):
+            mantissa, exponent = f"{row.p:.2e}".split("e")
+            p_latex = rf"${mantissa}\times10^{{{int(exponent)}}}$"
+            label = row.Contrast.replace("%", r"\%")
+            lines.append(f"{label} & {row.PH:.3f} & "
+                         f"$({row.lower95:.3f}, {row.upper95:.3f})$ & {p_latex} " + r"\\")
+        (output / f"task2b_{name}_table_rows.tex").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+
+    print("\nQUESTION 2(b): COEFFICIENTS (notes' AFT sign convention)")
+    print(coefficients.to_string(index=False, float_format=lambda x: f"{x:.5f}"))
+    print(f"Weibull alpha = {scale:.3f} days; eta = {shape:.5f}")
+    print("\nCOX HAZARD RATIOS (labelled PH in the report)")
+    print(cox_table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print("\nWEIBULL HAZARD RATIOS: exp(eta * beta dot change)")
+    print(weibull_table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print("Both tables use two-sided Wald tests and exponentiated normal intervals.")
+    # Do not compare Cox partial AIC with Weibull full-likelihood AIC.
+
+    # ========================================================
+    # 2(c): Three representative Cox profiles and grouped KM
+    # ========================================================
+    # Groups are for illustration only. EF is continuous in both fits.
+    # Count patients, deaths and censored observations for Table 4.
+    data["EF_group"] = pd.cut(data["ejection_fraction"],
+                              bins=[-np.inf, 30, 40, np.inf], labels=GROUPS)
+    group_summary = data.groupby("EF_group", observed=True).agg(
+        Patients=("time", "size"), Deaths=("DEATH_EVENT", "sum"),
+        Median_EF=("ejection_fraction", "median"), Max_followup=("time", "max"),
+    ).reindex(GROUPS)
+    group_summary["Censored"] = group_summary.Patients - group_summary.Deaths
+    group_summary.to_csv(output / "task2c_group_summary.csv")
+
+    profiles = pd.DataFrame({
+        "age": REFERENCE_AGE,
+        "ejection_fraction": PROFILE_EF,
+        "serum_creatinine": REFERENCE_CR,
+    }, index=pd.Index(GROUPS, name="EF_group"))
+    profiles.to_csv(output / "task2c_profiles.csv")
+    encoded_profiles = transform_covariates(profiles)
+
+    # lifelines centres the Cox baseline at the sample means internally.
+    # Predict at z=0 to obtain survival for the specified reference patient.
+    reference = pd.DataFrame({"age": [REFERENCE_AGE],
+                              "ejection_fraction": [REFERENCE_EF],
+                              "serum_creatinine": [REFERENCE_CR]})
+    reference_z = transform_covariates(reference)
+    reference_curves = pd.DataFrame({
+        "Cox": cox.predict_survival_function(reference_z).iloc[:, 0],
+        "Weibull": aft.predict_survival_function(reference_z).iloc[:, 0],
+    })
+    reference_curves.loc[0.0] = 1.0
+    reference_curves.sort_index().to_csv(
+        output / "task2b_reference_survival.csv", index_label="Time")
+    pd.DataFrame({
+        "Model": ["Cox", "Weibull AFT"],
+        "Log_likelihood": [cox.log_likelihood_, aft.log_likelihood_],
+        "Likelihood_type": ["partial", "full"],
+        "Weibull_shape": [np.nan, shape],
+    }).to_csv(output / "task2b_fit_details.csv", index=False)
+
+    # Estimate H0(t) using Breslow's sum of deaths / total risk score at
+    # each event time. This is at the specified z=0, rather than the internally
+    # mean-centred baseline from lifelines. For each fixed profile use
+    # S(t;z)=exp[-H0(t)*exp(beta dot z)]. The encoded profiles are
+    # (0,-13,0), (0,0,0), (0,12,0), matching the report's EF 25%,38%,50%.
+    baseline = breslow_baseline(analysis, beta_cox)
+    baseline.to_csv(output / "task2c_breslow_baseline.csv", index_label="Time")
+    relative_hazard = np.exp(encoded_profiles[PREDICTORS].to_numpy() @ beta_cox)
+    predicted = pd.DataFrame(
+        np.exp(-np.outer(baseline["H0"], relative_hazard)),
+        index=baseline.index, columns=profiles.index)
+    predicted.loc[0.0] = 1.0
+    predicted = predicted.sort_index()
+    predicted.to_csv(output / "task2c_cox_survival_predictions.csv", index_label="Time")
+
+    # For day 90 use the last step at or before 90, not linear interpolation.
+    day90 = profiles.copy()
+    day90["Cox_S90"] = predicted.loc[predicted.index <= 90].iloc[-1]
+    day90["Group_at_risk_day90"] = [
+        int(((data.EF_group == g) & (data.time >= 90)).sum()) for g in GROUPS
+    ]
+    day90.to_csv(output / "task2c_day90_survival.csv")
+
+    # Figure 3: each black curve is the Kaplan-Meier product
+    # product(1-d_j/n_j) within each observed EF group. Its grey shading is
+    # a pointwise 95% CI from Greenwood's formula with a log-log transform,
+    # as in Question 1(c). If G=sum[d_j/(n_j*(n_j-d_j))], then
+    # se(log(-log(S)))=sqrt(G)/abs(log(S)); transform the +/-1.96*se
+    # endpoints back using exp(-exp(.)), reversing their order.
+    # alpha=0.05 specifies the confidence level; ci_alpha is opacity.
+    #
+    # The coloured curve describes one profile at fixed age/creatinine;
+    # the KM curve mixes those covariates within a group. They need not
+    # coincide, and the upper two groups' KM ordering can differ from
+    # the fitted ordering. The grey intervals belong to KM, not Cox.
+    # Stop each fitted curve at that group's maximum observed follow-up.
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharex=True, sharey=True)
+    for ax, group, colour in zip(axes, GROUPS, COLOURS):
+        subset = data.loc[data.EF_group == group]
+        km = KaplanMeierFitter(alpha=0.05)
+        km.fit(subset.time, event_observed=subset.DEATH_EVENT, label="Kaplan–Meier")
+        km_table = km.survival_function_.join(km.confidence_interval_)
+        km_table.to_csv(output / f"task2c_KM_group{GROUPS.index(group) + 1}.csv",
+                        index_label="Time")
+        km.plot_survival_function(ax=ax, color="black", linewidth=1.8,
+                                  ci_show=True, ci_alpha=0.15, show_censors=False)
+        curve = predicted.loc[predicted.index <= subset.time.max(), group]
+        ax.step(curve.index, curve, where="post", color=colour,
+                linewidth=2, label="Cox fitted profile")
+        ax.set_title(f"{group}\nn = {len(subset)}, deaths = {subset.DEATH_EVENT.sum()}")
+        ax.set(xlabel="Time (days)", xlim=(0, data.time.max()), ylim=(0, 1.02))
+        ax.legend(loc="lower left", fontsize=9)
+    axes[0].set_ylabel("Survival probability")
+    save_figure(fig, output, "task2c_survival_profiles")
+
+    print("\nQUESTION 2(c): GROUPS AND PROFILES")
+    print(group_summary.to_string())
+    print(day90.round(3).to_string())
+    print("\nKM summarises each actual group; the fitted curve describes one profile.")
+    print(f"\nAll tables and figures saved to: {output}")
+
+
+if __name__ == "__main__":
+    main()
