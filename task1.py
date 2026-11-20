@@ -1,14 +1,5 @@
-"""Survival Models coursework: Question 1, parts (a)-(d).
-
-Put cwdat.csv beside this script, then run: python task1.py
-Dependencies: numpy pandas scipy matplotlib lifelines
-Install with: python -m pip install numpy pandas scipy matplotlib lifelines
-Verified with Python 3.12 and lifelines 0.30.3.
-
-The comments explain the calculations used in the report. Figures 1 and 2
-are saved as task1c_survival.png and task1d_cumulative_hazard.png. Numerical
-estimates and the nonparametric curves are also saved as CSV files.
-All calculations use unrounded estimates; rounding is only for display.
+"""
+Survival Models coursework: Question 1
 """
 
 from pathlib import Path
@@ -28,8 +19,7 @@ from scipy.special import logsumexp
 folder = Path(__file__).resolve().parent
 df = pd.read_csv(folder / "cwdat.csv")
 
-# One finite-value check also detects missing values. Keep only the checks
-# needed for the likelihood: positive times and a binary event indicator.
+# One finite-value check also detects missing values.
 if not np.isfinite(df[["T", "Delta"]].to_numpy()).all():
     raise ValueError("T and Delta must contain finite values with no missing data.")
 if not df["T"].gt(0).all() or not df["Delta"].isin([0, 1]).all():
@@ -55,11 +45,7 @@ print(f"Total observed time: {total_time:.3f}")
 
 
 # ============================================================
-# Part (a): Exponential maximum likelihood estimate
-# S(t) = exp(-rate * t)
-# Each event contributes log(rate) - rate*t to the log-likelihood;
-# a censored observation contributes -rate*t. Thus
-# ell(rate) = r*log(rate) - rate*total_time and rate_hat = r/total_time.
+# Part (a): Computation for the estimated parameter
 # ============================================================
 
 rate_hat = r / total_time
@@ -68,14 +54,7 @@ print(f"\nExponential rate estimate: {rate_hat:.5f}")
 
 
 # ============================================================
-# Part (b): Weibull maximum likelihood estimates
-# S(t) = exp(-lambda * t**eta)
-#
-# For a fixed eta:
-# lambda_hat(eta) = r / sum(t**eta)
-# Substitute this expression into the log-likelihood, leaving a function
-# of eta alone (the profile log-likelihood). Estimate eta numerically,
-# then substitute eta_hat into lambda_hat(eta).
+# Part (b): Computation for the Weibull parameters
 # ============================================================
 
 # log_t stores log times for every observation; event_log_time is the
@@ -101,9 +80,8 @@ def negative_profile_loglik(log_eta):
     return -loglik
 
 
-# Brent's scalar minimisation combines parabolic interpolation with
-# golden-section steps. Minimising -ell is equivalent to maximising ell;
-# derivatives are not required. result.x is the estimated log(eta).
+# Use Brent's method to minimise the negative profile log-likelihood.
+# result.x stores the estimated log(eta).
 result = minimize_scalar(
     negative_profile_loglik,
     method="brent",
@@ -146,25 +124,12 @@ time_grid = np.linspace(0, t.max(), 1000)
 
 
 # ============================================================
-# Part (c): Kaplan–Meier and fitted survival functions
-# At each event time t_j, let d_j be the number of events and n_j the
-# number at risk immediately before t_j. The Kaplan-Meier estimate is
-# S_KM(t) = product_{t_j <= t}(1 - d_j/n_j). Censored observations remain
-# at risk up to their censoring times, but do not cause a survival drop.
-#
-# The grey shading gives pointwise 95% confidence intervals for S_KM,
-# calculated by lifelines using Greenwood's formula and a log-log
-# transformation. For 0 < S_KM(t) < 1, define
-#   G(t) = sum_{t_j <= t} d_j / [n_j*(n_j-d_j)],
-#   g(t) = log(-log(S_KM(t))),
-#   se_g(t) = sqrt(G(t)) / abs(log(S_KM(t))).
-# Transform g +/- 1.96*se_g back to the survival scale. Since the inverse
-# exp(-exp(g)) is decreasing, the lower/upper endpoints are respectively
-# exp(-exp(g + 1.96*se_g)) and exp(-exp(g - 1.96*se_g)). The package handles
-# the endpoints S_KM=1 and S_KM=0. These are pointwise intervals, not a
-# simultaneous confidence band or intervals for the fitted model curves.
+# Part (c): Plot the Kaplan–Meier and fitted survival curves
 # ============================================================
 
+# Fit the Kaplan–Meier estimate using KaplanMeierFitter 
+# which computes 95% confidence
+# intervals using Greenwood's formula with a log-log transformation.
 km = KaplanMeierFitter(alpha=0.05)
 km.fit(
     durations=t,
@@ -216,12 +181,7 @@ fig.savefig(folder / "task1c_survival.png")
 
 
 # ============================================================
-# Part (d): Nelson–Aalen cumulative hazard estimate
-# H_NA(t) = sum(d_j / n_j)
-# Compare this step function with H_exp(t)=rate_hat*t and
-# H_Weibull(t)=lambda_hat*t**eta_hat. On log-log axes the fitted curves
-# are straight lines, with slopes 1 (exponential) and eta_hat (Weibull).
-# Exclude time zero when taking logarithms.
+# Part (d): Compute and plot the cumulative hazard estimates
 # ============================================================
 
 # Distinct ordered event times and corresponding event counts
@@ -230,7 +190,7 @@ event_times, d_j = np.unique(
     return_counts=True,
 )
 
-# Number at risk immediately before each event time.
+# Risk set immediately before each event time.
 # Individuals censored at that time are included.
 sorted_t = np.sort(t)
 n_j = n - np.searchsorted(
