@@ -280,7 +280,7 @@ def main():
     profiles.to_csv(output / "task2c_profiles.csv")
     encoded_profiles = transform_covariates(profiles)
 
-    # Predict survival at the reference profile z=0.
+    # Predict survival at the baseline z=0.
     reference = pd.DataFrame({"age": [REFERENCE_AGE],
                               "ejection_fraction": [REFERENCE_EF],
                               "serum_creatinine": [REFERENCE_CR]})
@@ -299,7 +299,7 @@ def main():
         "Weibull_shape": [np.nan, shape],
     }).to_csv(output / "task2b_fit_details.csv", index=False)
 
-    # Compute the baseline at z=0 and obtain survival for each profile.
+    # Compute the baseline at z=0 and obtain survival for each model.
     baseline = breslow_baseline(analysis, beta_cox)
     baseline.to_csv(output / "task2c_breslow_baseline.csv", index_label="Time")
     relative_hazard = np.exp(encoded_profiles[PREDICTORS].to_numpy() @ beta_cox)
@@ -318,9 +318,9 @@ def main():
     ]
     day90.to_csv(output / "task2c_day90_survival.csv")
 
-    # Plot each group's Kaplan–Meier estimate with pointwise 95% CIs
+    # Plot each group's Kaplan–Meier estimate with 95% CIs
     # (Greenwood with a log-log transform), alongside its fitted profile.
-    # Stop each fitted curve at the group's maximum observed follow-up.
+    # Stop each fitted curve at the group's maximum observed time range.
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharex=True, sharey=True)
     for ax, group, colour in zip(axes, GROUPS, COLOURS):
         subset = data.loc[data.EF_group == group]
