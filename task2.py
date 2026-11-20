@@ -1,7 +1,6 @@
 """
 Survival Models coursework: Question 2
-Data source: UCI Heart Failure Clinical Records, DOI 10.24432/C5Z89R
-(CC BY 4.0).
+Data source: UCI Heart Failure Clinical Records, DOI 10.24432/C5Z89R.
 """
 
 from pathlib import Path
@@ -22,12 +21,11 @@ REFERENCE_CR = 1.1
 FORMULA = "age_c + ef_c + ln_cr_c"
 GROUPS = ["EF <= 30%", "30% < EF <= 40%", "EF > 40%"]
 COLOURS = ["tab:orange", "tab:green", "tab:blue"]
-# EF values for the three fitted profiles.
 PROFILE_EF = [25.0, 38.0, 50.0]
 
 
 def transform_covariates(data):
-    """Centre age and EF, and store ln(creatinine/1.1)."""
+    """Standardise age and EF, and store ln(creatinine/1.1)."""
     return pd.DataFrame({
         "age_c": data["age"] - REFERENCE_AGE,
         "ef_c": data["ejection_fraction"] - REFERENCE_EF,
@@ -179,7 +177,7 @@ def main():
     print(descriptive.round(3).to_string(index=False))
 
     # ========================================================
-    # Part (b): Fit the Cox and Weibull models
+    # Part (b): Fit the Cox and AFT models
     # ========================================================
     # Store the transformed covariates with follow-up time and event status.
     analysis = data[["time", "DEATH_EVENT"]].join(transform_covariates(data))
@@ -190,7 +188,7 @@ def main():
     cox.fit(analysis, duration_col="time", event_col="DEATH_EVENT",
             formula=FORMULA)
 
-    # Fit the Weibull AFT model with a common shape parameter.
+    # Fit the AFT model with a common shape parameter.
     aft = WeibullAFTFitter(alpha=0.05, model_ancillary=False)
     aft.fit(analysis, duration_col="time", event_col="DEATH_EVENT",
             formula=FORMULA)
@@ -198,13 +196,11 @@ def main():
     cox.summary.to_csv(output / "task2b_cox_full_summary.csv")
     aft.summary.to_csv(output / "task2b_weibull_full_summary.csv")
 
-    # Extract shape and scale, and reverse the software's AFT coefficient
-    # signs to use the lecture notes' convention.
     shape = float(np.exp(aft.params_.loc[("rho_", "Intercept")]))
     scale = float(np.exp(aft.params_.loc[("lambda_", "Intercept")]))
     beta_aft = -aft.params_.loc["lambda_", PREDICTORS].to_numpy()
     beta_cox = cox.params_.loc[PREDICTORS].to_numpy()
-    # Compute Weibull PH coefficients and their covariance for inference.
+    # Compute proportional hazards coefficients and their covariance for inference.
     theta, covariance_ph, _ = weibull_ph_inference(
         analysis, scale, shape, beta_aft)
     pd.DataFrame(covariance_ph, index=PREDICTORS, columns=PREDICTORS).to_csv(
